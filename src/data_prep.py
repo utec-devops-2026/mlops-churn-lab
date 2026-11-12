@@ -1,86 +1,50 @@
-"""Preparación de datos - ejecutable desde CLI o GitHub Actions."""
-import pandas as pd
-import joblib
-import os
+"""CRISP-ML(Q) fase 2 · Preparación de datos.
+
+Solo limpia y parte el dataset. El escalado y el encoding NO se hacen aquí:
+viven dentro del Pipeline de scikit-learn (src/features.py) para que el modelo
+aplique en producción exactamente las mismas transformaciones que en entrenamiento.
+"""
+import json
+
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, StandardScaler
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), '../data')
-os.makedirs(DATA_DIR, exist_ok=True)
-
-RAW_FILENAME = 'telco_customer_churn_mlops.csv'
+from common import DATA_DIR, feature_columns, load_config, load_raw
 
 
-def load_raw(data_dir: str = DATA_DIR) -> pd.DataFrame:
-    path = os.path.join(data_dir, RAW_FILENAME)
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f'Dataset no encontrado: {path}\n'
-            f'Asegúrate de que {RAW_FILENAME} esté en {data_dir}/'
-        )
-    df = pd.read_csv(path)
-    print(f'Dataset cargado: {df.shape} — {path}')
-    return df
-
-
-def preprocess(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.rename(columns={
-        'customer_id':             'customerID',
-        'senior_citizen':          'SeniorCitizen',
-        'tenure_months':           'tenure',
-        'contract_type':           'Contract',
-        'internet_service':        'InternetService',
-        'monthly_charges':         'MonthlyCharges',
-        'support_tickets_last_6m': 'support_tickets',
-        'churn':                   'Churn',
-    })
-
-    df = df.drop(columns=['customerID'], errors='ignore')
-
-    # Imputar nulos en InternetService
-    df['InternetService'] = df['InternetService'].fillna('No')
-
-    # Target
-    df['Churn'] = (df['Churn'] == 'Yes').astype(int)
-
-    # Encoding binario
-    df['gender'] = LabelEncoder().fit_transform(df['gender'])
-
-    # One-hot para categóricas restantes
-    cat_cols = df.select_dtypes(include='object').columns.tolist()
-    df = pd.get_dummies(df, columns=cat_cols, drop_first=True)
-
-    return df
+def clean(df, cfg):
+    target = cfg["data"]["target"]
+    df = df.drop(columns=[cfg["data"]["id_column"]], errors="ignore")
+    df[target] = (df[target] == "Yes").astype(int)
+    return df[feature_columns(cfg) + [target]]
 
 
 def main():
-    df_raw = load_raw()
-    df = preprocess(df_raw.copy())
+    cfg = load_config()
+    target = cfg["data"]["target"]
+    df = clean(load_raw(cfg), cfg)
 
-    X = df.drop(columns=['Churn'])
-    y = df['Churn']
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+    train, test = train_test_split(
+        df,
+        test_size=cfg["project"]["test_size"],
+        random_state=cfg["project"]["random_state"],
+        stratify=df[target],
     )
 
-    scaler = StandardScaler()
-    num_features = ['tenure', 'MonthlyCharges', 'support_tickets']
-    X_train[num_features] = scaler.fit_transform(X_train[num_features])
-    X_test[num_features] = scaler.transform(X_test[num_features])
+    DATA_DIR.mkdir(exist_ok=True)
+    train.to_csv(DATA_DIR / "train.csv", index=False)
+    test.to_csv(DATA_DIR / "test.csv", index=False)
 
-    X_train.to_csv(os.path.join(DATA_DIR, 'X_train.csv'), index=False)
-    X_test.to_csv(os.path.join(DATA_DIR, 'X_test.csv'), index=False)
-    y_train.to_csv(os.path.join(DATA_DIR, 'y_train.csv'), index=False)
-    y_test.to_csv(os.path.join(DATA_DIR, 'y_test.csv'), index=False)
-    joblib.dump(scaler, os.path.join(DATA_DIR, 'scaler.pkl'))
-    pd.Series(X_train.columns.tolist()).to_csv(
-        os.path.join(DATA_DIR, 'feature_names.csv'), index=False, header=False
-    )
-
-    print(f'Train: {X_train.shape} | Test: {X_test.shape}')
-    print('Artefactos guardados en data/')
+    summary = {
+        "train_rows": len(train),
+        "test_rows": len(test),
+        "train_churn_rate": round(float(train[target].mean()), 4),
+        "test_churn_rate": round(float(test[target].mean()), 4),
+        "features": feature_columns(cfg),
+    }
+    with open(DATA_DIR / "data_prep_summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    print(json.dumps(summary, indent=2))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

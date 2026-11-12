@@ -73,4 +73,5 @@ def client():
         import app.main as app_module
         from fastapi.testclient import TestClient
 
-        yield TestClient(app_module.app)
+    # Los mocks solo hacen falta mientras se importa la API
+    yield TestClient(app_module.app)

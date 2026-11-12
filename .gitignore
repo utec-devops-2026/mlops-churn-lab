@@ -38,6 +38,12 @@ data/X_*.csv
 data/y_*.csv
 data/batch_*.csv
 data/telco_churn_raw.csv
+
+data/train.csv
+data/test.csv
+reports/data_validation.json
+reports/evaluation_report.json
+
 # Uncomment to track data with DVC instead:
 # !data/.gitkeep
 

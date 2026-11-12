@@ -1,0 +1,60 @@
+# Fuente única de verdad del proyecto: lo que se decide en CRISP-ML(Q) fase 1
+# (negocio y datos) vive aquí y lo leen todos los scripts.
+
+project:
+  name: churn-predictor
+  experiment: churn-prediction-fintech
+  random_state: 42
+  test_size: 0.2
+
+# ── Fase 1 · Criterios de éxito ─────────────────────────────────────────────
+# Costos en soles por cliente. Un falso negativo (churner no detectado) cuesta
+# más que un falso positivo (oferta de retención a quien no se iba).
+business:
+  cost_fn: 200
+  cost_fp: 100
+
+# ── Fase 1 · Contrato de datos ──────────────────────────────────────────────
+data:
+  raw_path: data/telco_customer_churn_mlops.csv
+  id_column: customer_id
+  target: churn
+  min_rows: 200
+  # Proporción aceptable de la clase positiva (alerta si el dataset cambia de naturaleza)
+  target_rate: {min: 0.20, max: 0.80}
+  columns:
+    gender:                  {type: category, values: [Male, Female]}
+    senior_citizen:          {type: int, min: 0, max: 1}
+    tenure_months:           {type: int, min: 0, max: 120}
+    contract_type:           {type: category, values: [Month-to-Month, One Year, Two Year]}
+    internet_service:        {type: category, values: [Fiber, DSL, None]}
+    monthly_charges:         {type: float, min: 0, max: 500}
+    support_tickets_last_6m: {type: int, min: 0, max: 50}
+    churn:                   {type: category, values: ["Yes", "No"]}
+
+features:
+  numeric: [tenure_months, monthly_charges, support_tickets_last_6m]
+  categorical: [gender, contract_type, internet_service]
+  binary: [senior_citizen]
+
+# ── Fase 3 · Modelado ───────────────────────────────────────────────────────
+training:
+  cv_folds: 5
+  selection_metric: cv_f1_mean
+
+# ── Fase 4 · Quality gate de evaluación ─────────────────────────────────────
+quality_gate:
+  min_f1: 0.60
+  min_roc_auc: 0.70
+  must_beat_baseline: true
+  # Diferencia máxima de recall entre grupos (gender, senior_citizen)
+  max_recall_gap: 0.25
+  slices: [gender, senior_citizen]
+
+# ── Fase 6 · Monitoreo ──────────────────────────────────────────────────────
+monitoring:
+  psi_warning: 0.10
+  psi_critical: 0.25
+  ks_alpha: 0.05
+  max_f1_drop: 0.10
+  min_drifted_features: 2

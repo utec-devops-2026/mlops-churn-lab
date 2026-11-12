@@ -1,115 +1,117 @@
-"""Entrenamiento de modelos con MLflow tracking. Entrena los 3 modelos y guarda el mejor por F1."""
+"""CRISP-ML(Q) fase 3 · Modelado con MLflow tracking.
+
+Entrena un baseline y tres candidatos. Cada candidato es un Pipeline
+(preprocesamiento + clasificador) evaluado con validación cruzada estratificada
+sobre train. El mejor se elige por F1 de validación cruzada: el set de test
+no participa en la selección, queda reservado para la fase de evaluación.
+"""
 import argparse
 import json
-import os
+
 import joblib
-import pandas as pd
 import mlflow
 import mlflow.sklearn
-
-from sklearn.linear_model import LogisticRegression
+import pandas as pd
+from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold, cross_validate
 from xgboost import XGBClassifier
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, precision_score, recall_score
 
-DATA_DIR  = os.path.join(os.path.dirname(__file__), '../data')
-MLFLOW_URI = os.path.join(os.path.dirname(__file__), '../mlruns')
+from common import DATA_DIR, MLFLOW_URI, feature_columns, load_config
+from features import build_pipeline
 
-ALL_MODELS = ['logistic', 'random_forest', 'xgboost']
+CANDIDATES = ["logistic", "random_forest", "xgboost"]
+SCORING = {"f1": "f1", "roc_auc": "roc_auc", "precision": "precision", "recall": "recall"}
 
 
-def get_model(model_type: str, y_train):
-    neg = (y_train == 0).sum()
-    pos = (y_train == 1).sum()
-    spw = round(neg / pos, 2)
-
-    configs = {
-        'logistic': (
-            LogisticRegression(C=1.0, max_iter=500, class_weight='balanced', solver='lbfgs', random_state=42),
-            {'C': 1.0, 'max_iter': 500, 'class_weight': 'balanced'}
+def get_estimator(name: str, seed: int):
+    estimators = {
+        # Baseline: predice siempre la clase positiva. Si un modelo no le gana, no aporta.
+        "baseline": (DummyClassifier(strategy="constant", constant=1), {"strategy": "constant=1"}),
+        "logistic": (
+            LogisticRegression(C=1.0, max_iter=500, class_weight="balanced", random_state=seed),
+            {"C": 1.0, "max_iter": 500, "class_weight": "balanced"},
         ),
-        'random_forest': (
-            RandomForestClassifier(n_estimators=100, max_depth=10, class_weight='balanced', random_state=42, n_jobs=-1),
-            {'n_estimators': 100, 'max_depth': 10, 'class_weight': 'balanced'}
+        "random_forest": (
+            RandomForestClassifier(n_estimators=200, max_depth=5, class_weight="balanced",
+                                   random_state=seed, n_jobs=-1),
+            {"n_estimators": 200, "max_depth": 5, "class_weight": "balanced"},
         ),
-        'xgboost': (
-            XGBClassifier(n_estimators=200, max_depth=6, learning_rate=0.1, scale_pos_weight=spw,
-                          random_state=42, eval_metric='logloss', verbosity=0),
-            {'n_estimators': 200, 'max_depth': 6, 'learning_rate': 0.1, 'scale_pos_weight': spw}
+        "xgboost": (
+            XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.1, random_state=seed,
+                          eval_metric="logloss", verbosity=0),
+            {"n_estimators": 100, "max_depth": 3, "learning_rate": 0.1},
         ),
     }
-    return configs[model_type]
+    return estimators[name]
 
 
-def train_one(model_type, X_train, X_test, y_train, y_test, experiment):
-    model, params = get_model(model_type, y_train)
+def train_one(name, X, y, cfg):
+    seed = cfg["project"]["random_state"]
+    estimator, params = get_estimator(name, seed)
+    pipeline = build_pipeline(estimator, cfg)
+    cv = StratifiedKFold(n_splits=cfg["training"]["cv_folds"], shuffle=True, random_state=seed)
 
-    with mlflow.start_run(run_name=model_type) as run:
-        mlflow.set_tags({'model_type': model_type, 'dataset': 'telco_churn', 'task': 'binary_classification'})
-        mlflow.log_params(params)
-        mlflow.log_param('train_size', len(X_train))
-        mlflow.log_param('test_size', len(X_test))
+    with mlflow.start_run(run_name=name) as run:
+        mlflow.set_tags({"model_type": name, "dataset": "telco_churn", "crisp_mlq_phase": "modeling"})
+        mlflow.log_params({**params, "cv_folds": cv.get_n_splits(), "train_size": len(X)})
 
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-        y_prob = model.predict_proba(X_test)[:, 1]
-
-        metrics = {
-            'accuracy':  round(accuracy_score(y_test, y_pred), 4),
-            'precision': round(precision_score(y_test, y_pred, zero_division=0), 4),
-            'recall':    round(recall_score(y_test, y_pred, zero_division=0), 4),
-            'f1':        round(f1_score(y_test, y_pred, zero_division=0), 4),
-            'roc_auc':   round(roc_auc_score(y_test, y_prob), 4),
-        }
+        scores = cross_validate(pipeline, X, y, cv=cv, scoring=SCORING)
+        metrics = {}
+        for metric in SCORING:
+            fold_scores = scores[f"test_{metric}"]
+            metrics[f"cv_{metric}_mean"] = round(float(fold_scores.mean()), 4)
+            metrics[f"cv_{metric}_std"] = round(float(fold_scores.std()), 4)
         mlflow.log_metrics(metrics)
-        mlflow.sklearn.log_model(model, 'model', input_example=X_train.head(3))
 
-    return {'model_type': model_type, 'run_id': run.info.run_id, 'metrics': metrics, 'model_obj': model}
+        # Modelo final: se reentrena con todo train
+        pipeline.fit(X, y)
+        mlflow.sklearn.log_model(pipeline, "model", input_example=X.head(3))
+
+    return {"model_type": name, "run_id": run.info.run_id, "metrics": metrics, "pipeline": pipeline}
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', default='all', choices=['logistic', 'random_forest', 'xgboost', 'all'],
-                        help='Modelo a entrenar. "all" entrena los 3 y elige el mejor por F1.')
-    parser.add_argument('--experiment', default='churn-prediction-fintech')
+    parser.add_argument("--model", default="all", choices=CANDIDATES + ["all"])
     args = parser.parse_args()
 
-    X_train = pd.read_csv(os.path.join(DATA_DIR, 'X_train.csv'))
-    X_test  = pd.read_csv(os.path.join(DATA_DIR, 'X_test.csv'))
-    y_train = pd.read_csv(os.path.join(DATA_DIR, 'y_train.csv')).squeeze()
-    y_test  = pd.read_csv(os.path.join(DATA_DIR, 'y_test.csv')).squeeze()
+    cfg = load_config()
+    target = cfg["data"]["target"]
+    train = pd.read_csv(DATA_DIR / "train.csv", keep_default_na=False)
+    X, y = train[feature_columns(cfg)], train[target]
 
-    mlflow.set_tracking_uri(f'file://{os.path.abspath(MLFLOW_URI)}')
-    mlflow.set_experiment(args.experiment)
+    mlflow.set_tracking_uri(MLFLOW_URI)
+    mlflow.set_experiment(cfg["project"]["experiment"])
 
-    to_train = ALL_MODELS if args.model == 'all' else [args.model]
-    results  = []
+    baseline = train_one("baseline", X, y, cfg)
+    print(f"baseline       F1 CV = {baseline['metrics']['cv_f1_mean']:.4f}")
 
-    for model_type in to_train:
-        print(f'Entrenando {model_type}...')
-        result = train_one(model_type, X_train, X_test, y_train, y_test, args.experiment)
+    results = []
+    for name in CANDIDATES if args.model == "all" else [args.model]:
+        result = train_one(name, X, y, cfg)
         results.append(result)
-        print(f'  F1={result["metrics"]["f1"]:.4f}  ROC={result["metrics"]["roc_auc"]:.4f}')
+        m = result["metrics"]
+        print(f"{name:<14} F1 CV = {m['cv_f1_mean']:.4f} ± {m['cv_f1_std']:.4f} | ROC-AUC CV = {m['cv_roc_auc_mean']:.4f}")
 
-    # Seleccionar mejor por F1
-    best = max(results, key=lambda r: r['metrics']['f1'])
-
-    print(f'\nMejor modelo: {best["model_type"]} (F1={best["metrics"]["f1"]:.4f})')
+    selection = cfg["training"]["selection_metric"]
+    best = max(results, key=lambda r: r["metrics"][selection])
+    print(f"\nMejor modelo por {selection}: {best['model_type']}")
 
     meta = {
-        'best_model':  best['model_type'],
-        'best_run_id': best['run_id'],
-        'metrics':     best['metrics'],
-        'experiment':  args.experiment,
-        'all_results': [{'model': r['model_type'], 'f1': r['metrics']['f1'], 'roc_auc': r['metrics']['roc_auc']}
-                        for r in results],
+        "best_model": best["model_type"],
+        "best_run_id": best["run_id"],
+        "selection_metric": selection,
+        "metrics": best["metrics"],
+        "baseline_metrics": baseline["metrics"],
+        "all_results": [{"model": r["model_type"], **r["metrics"]} for r in results],
     }
-    with open(os.path.join(DATA_DIR, 'best_model_meta.json'), 'w') as f:
+    with open(DATA_DIR / "best_model_meta.json", "w") as f:
         json.dump(meta, f, indent=2)
+    joblib.dump(best["pipeline"], DATA_DIR / "best_model.pkl")
+    print(f"Guardado data/best_model.pkl | run_id: {best['run_id']}")
 
-    joblib.dump(best['model_obj'], os.path.join(DATA_DIR, 'best_model.pkl'))
-    print(f'Guardado: best_model.pkl ({best["model_type"]}) | run_id: {best["run_id"]}')
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
