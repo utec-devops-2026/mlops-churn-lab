@@ -53,7 +53,7 @@ uvicorn app.main:app --port 8000      # http://localhost:8000/docs
 ├── app/main.py                     # API FastAPI: /predict, /predict/batch, /health
 ├── src/
 │   ├── data_prep.py                # limpieza, encoding, escalado y split
-│   ├── train.py                    # 3 modelos con MLflow tracking
+│   ├── train.py                    # 4 modelos con MLflow tracking
 │   └── evaluate_and_register.py    # registro en MLflow Model Registry
 ├── tests/                          # tests de la API con el modelo mockeado
 ├── data/
@@ -84,3 +84,16 @@ uvicorn app.main:app --port 8000      # http://localhost:8000/docs
 |---|---|---|
 | 14.1 | 1 a 4: negocio y datos, preparación, modelado, evaluación | Contrato de datos, Pipeline de scikit-learn, validación cruzada, umbral por costo, modelo `@champion` |
 | 14.2 | 5 y 6: despliegue, monitoreo | API sin skew, imagen en Docker Hub, drift, reentrenamiento automático |
+
+## Comparación de candidatos
+
+Validación cruzada estratificada de 5 folds sobre train. `GradientBoostingClassifier`
+se ejecuta con `n_estimators=100`, `learning_rate=0.1`, `max_depth=3` y
+`random_state=42`; esos hiperparámetros se registran en MLflow.
+
+| Modelo | F1 CV (media ± std) | ROC-AUC CV (media ± std) |
+|---|---:|---:|
+| Gradient Boosting | 0.6476 ± 0.0761 | 0.6858 ± 0.0604 |
+
+El mejor candidato sigue siendo `random_forest` (F1 CV 0.6900), por lo que
+agregar Gradient Boosting no cambia la selección.

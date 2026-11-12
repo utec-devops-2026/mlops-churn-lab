@@ -1,6 +1,6 @@
 """CRISP-ML(Q) fase 3 · Modelado con MLflow tracking.
 
-Entrena un baseline y tres candidatos. Cada candidato es un Pipeline
+Entrena un baseline y cuatro candidatos. Cada candidato es un Pipeline
 (preprocesamiento + clasificador) evaluado con validación cruzada estratificada
 sobre train. El mejor se elige por F1 de validación cruzada: el set de test
 no participa en la selección, queda reservado para la fase de evaluación.
@@ -13,7 +13,7 @@ import mlflow
 import mlflow.sklearn
 import pandas as pd
 from sklearn.dummy import DummyClassifier
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold, cross_validate
 from xgboost import XGBClassifier
@@ -21,7 +21,7 @@ from xgboost import XGBClassifier
 from common import DATA_DIR, MLFLOW_URI, feature_columns, load_config
 from features import build_pipeline
 
-CANDIDATES = ["logistic", "random_forest", "xgboost"]
+CANDIDATES = ["logistic", "random_forest", "xgboost", "gradient_boosting"]
 SCORING = {"f1": "f1", "roc_auc": "roc_auc", "precision": "precision", "recall": "recall"}
 
 
@@ -42,6 +42,11 @@ def get_estimator(name: str, seed: int):
             XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.1, random_state=seed,
                           eval_metric="logloss", verbosity=0),
             {"n_estimators": 100, "max_depth": 3, "learning_rate": 0.1},
+        ),
+        "gradient_boosting": (
+            GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, max_depth=3,
+                                       random_state=seed),
+            {"n_estimators": 100, "learning_rate": 0.1, "max_depth": 3, "random_state": seed},
         ),
     }
     return estimators[name]
