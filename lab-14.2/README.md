@@ -4,6 +4,8 @@ Archivos largos de la guía 12 (churn con CRISP-ML(Q), parte 2). La guía explic
 
 Se copian a la raíz de tu fork conservando la ruta: `lab-14.2/src/monitor.py` va a `src/monitor.py`.
 
+Viven en la rama `lab-14.2-archivos`; la rama `main` es el punto de partida del laboratorio y no los incluye.
+
 `tests/agregar_a_test_api.py` es la excepción: su contenido se agrega al final de `tests/test_api.py`.
 
 - `infra/alb.tf`
