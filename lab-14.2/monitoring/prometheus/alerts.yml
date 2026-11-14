@@ -1,0 +1,10 @@
+groups:
+  - name: churn-model
+    rules:
+      - alert: ChurnModelRetrainNeeded
+        expr: model_retrain_needed == 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "El monitor decidió REENTRENAR el modelo de churn"

@@ -1,0 +1,314 @@
+name: MLOps Pipeline - Churn Predictor
+
+# Cada job es una fase de CRISP-ML(Q) con su quality gate:
+# si el gate falla, el pipeline se detiene y nada llega a producción.
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'app/**'
+      - 'tests/**'
+      - 'configs/**'
+      - 'data/telco_customer_churn_mlops.csv'
+      - 'Dockerfile'
+      - 'requirements*.txt'
+      - 'scripts/deploy_ecs.sh'
+      - '.github/workflows/mlops.yml'
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.10'
+  IMAGE_NAME: churn-predictor
+  AWS_REGION: us-east-1
+
+jobs:
+
+  # ── Q · Tests de código ────────────────────────────────────────────────────
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - name: Tests unitarios (contrato, pipeline de features, API)
+        run: pytest tests/ -v --tb=short
+
+  # ── Fase 1 · Data Understanding: contrato de datos ─────────────────────────
+  data-validation:
+    name: Data Validation
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - name: Validar contrato de datos
+        run: python src/validate_data.py
+      - name: Subir reporte de validación
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-validation-report
+          path: reports/data_validation.json
+
+  # ── Fase 2 · Data Preparation ──────────────────────────────────────────────
+  data-prep:
+    name: Data Preparation
+    runs-on: ubuntu-latest
+    needs: data-validation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - name: Limpiar y partir el dataset
+        run: python src/data_prep.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: data-prep-artifacts
+          path: data/
+
+  # ── Fase 3 · Modeling ──────────────────────────────────────────────────────
+  train:
+    name: Modeling
+    runs-on: ubuntu-latest
+    needs: data-prep
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: data-prep-artifacts
+          path: data/
+      - name: Entrenar baseline y candidatos con validación cruzada
+        run: python src/train.py --model all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: train-artifacts
+          path: |
+            mlruns/
+            data/
+
+  # ── Fase 4 · Evaluation: quality gate + registro ───────────────────────────
+  evaluate:
+    name: Evaluation
+    runs-on: ubuntu-latest
+    needs: train
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: train-artifacts
+          path: .
+      - name: Evaluar, aplicar quality gate y registrar
+        run: python src/evaluate_and_register.py
+      - name: Resumen de evaluación
+        if: always()
+        run: |
+          if [ -f reports/model_card.md ]; then
+            cat reports/model_card.md >> $GITHUB_STEP_SUMMARY
+          elif [ -f reports/evaluation_report.json ]; then
+            echo "## Quality gate no superado" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat reports/evaluation_report.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-artifacts
+          retention-days: 30
+          path: |
+            data/
+            reports/
+
+  # ── Fase 5 · Deployment: smoke test + skew test ────────────────────────────
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: evaluate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: production-artifacts
+          path: .
+      - name: Levantar la API con el modelo champion
+        run: |
+          uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:8000/health && break
+            sleep 1
+          done
+          curl -sf http://localhost:8000/model/info
+      - name: Test de training-serving skew
+        run: API_URL=http://localhost:8000 pytest tests/test_skew.py -v
+      - name: Predicción de alto y bajo riesgo
+        run: |
+          predict() {
+            curl -sf -X POST http://localhost:8000/predict \
+              -H 'Content-Type: application/json' -d "$1"
+          }
+          HIGH=$(predict '{"gender":"Male","senior_citizen":0,"tenure_months":3,"contract_type":"Month-to-Month","internet_service":"Fiber","monthly_charges":130,"support_tickets_last_6m":9}')
+          LOW=$(predict '{"gender":"Female","senior_citizen":0,"tenure_months":60,"contract_type":"One Year","internet_service":"DSL","monthly_charges":40,"support_tickets_last_6m":0}')
+          echo "alto riesgo: $HIGH"
+          echo "bajo riesgo: $LOW"
+          python - "$HIGH" "$LOW" <<'PY'
+          import json, sys
+          high, low = (json.loads(a)["churn_probability"] for a in sys.argv[1:3])
+          assert 0 <= low < high <= 1, f"probabilidades inconsistentes: alto={high} bajo={low}"
+          PY
+
+  # ── Fase 5 · Deployment: imagen en Amazon ECR ──────────────────────────────
+  build-and-publish:
+    name: Build and Publish
+    runs-on: ubuntu-latest
+    needs: smoke-test
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: production-artifacts
+          path: .
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+      - name: Build de la imagen
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.IMAGE_NAME }}
+        run: docker build -t $IMAGE:${{ github.sha }} .
+      - name: Probar el contenedor antes de publicar
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.IMAGE_NAME }}
+        run: |
+          docker run -d --name churn-api -p 8000:8000 $IMAGE:${{ github.sha }}
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/health && break
+            sleep 1
+          done
+          curl -sf http://localhost:8000/model/info
+          docker rm -f churn-api
+      - name: Publicar con tag de commit (y latest solo desde main)
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.IMAGE_NAME }}
+        run: |
+          docker push $IMAGE:${{ github.sha }}
+          echo "Imagen publicada en ECR: \`${{ env.IMAGE_NAME }}:${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            docker tag $IMAGE:${{ github.sha }} $IMAGE:latest
+            docker push $IMAGE:latest
+            echo "Tag \`latest\` actualizado" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ── Fase 5 · Deployment: staging en AWS (solo develop) ─────────────────────
+  deploy-staging:
+    name: Deploy · Staging
+    runs-on: ubuntu-latest
+    needs: build-and-publish
+    # AWS_DEPLOY=true activa el despliegue cuando la infraestructura ya existe
+    if: vars.AWS_DEPLOY == 'true' && github.ref == 'refs/heads/develop'
+    concurrency: deploy-staging
+    environment:
+      name: staging
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Desplegar la imagen del commit en staging
+        id: deploy
+        run: |
+          REPOSITORY=$(aws ecr describe-repositories --repository-names "$IMAGE_NAME" \
+            --query 'repositories[0].repositoryUri' --output text)
+          bash scripts/deploy_ecs.sh staging "$REPOSITORY:${{ github.sha }}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: production-artifacts
+          path: .
+      - name: Test de training-serving skew contra staging
+        run: API_URL=${{ steps.deploy.outputs.url }} pytest tests/test_skew.py -v
+      - name: Resumen
+        run: |
+          echo "## Staging desplegado" >> $GITHUB_STEP_SUMMARY
+          echo "API: ${{ steps.deploy.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "Task definition: \`${{ steps.deploy.outputs.task_definition }}\`" >> $GITHUB_STEP_SUMMARY
+
+  # ── Fase 5 · Deployment: producción en AWS (solo main, con aprobación) ─────
+  deploy-production:
+    name: Deploy · Production
+    runs-on: ubuntu-latest
+    needs: build-and-publish
+    if: vars.AWS_DEPLOY == 'true' && github.ref == 'refs/heads/main'
+    concurrency: deploy-production
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Desplegar la imagen del commit en producción
+        id: deploy
+        run: |
+          REPOSITORY=$(aws ecr describe-repositories --repository-names "$IMAGE_NAME" \
+            --query 'repositories[0].repositoryUri' --output text)
+          bash scripts/deploy_ecs.sh prod "$REPOSITORY:${{ github.sha }}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: production-artifacts
+          path: .
+      - name: Test de training-serving skew contra producción
+        run: API_URL=${{ steps.deploy.outputs.url }} pytest tests/test_skew.py -v
+      - name: Resumen
+        run: |
+          echo "## Producción desplegada" >> $GITHUB_STEP_SUMMARY
+          echo "API: ${{ steps.deploy.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "Task definition: \`${{ steps.deploy.outputs.task_definition }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Rollback: \`${{ steps.deploy.outputs.previous_task_definition }}\`" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,44 @@
+name: churn-monitoring
+
+services:
+  api:
+    # Por defecto construye la imagen local. Para usar la publicada en ECR:
+    #   API_IMAGE=<url del repositorio>:latest docker compose up -d
+    image: ${API_IMAGE:-churn-predictor:local}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      # El log de predicciones queda en el host para que monitor.py lo lea
+      - ../logs:/app/logs
+
+  pushgateway:
+    image: prom/pushgateway:v1.9.0
+    ports:
+      - "9091:9091"
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    depends_on:
+      - api
+      - pushgateway
+
+  grafana:
+    image: grafana/grafana-oss:11.3.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus

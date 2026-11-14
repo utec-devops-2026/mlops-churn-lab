@@ -1,0 +1,80 @@
+name: Model Monitoring - Churn Predictor
+
+# CRISP-ML(Q) fase 6: monitoreo programado. Si el monitor decide REENTRENAR
+# (exit 42), dispara el pipeline completo: eso es Continuous Training.
+
+on:
+  schedule:
+    - cron: '0 13 * * 1'   # lunes 08:00 hora de Lima
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: 'Escenario de producción a simular'
+        default: 'none'
+        type: choice
+        options: [none, price_hike, competitor]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  monitor:
+    name: Drift + Performance
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+
+      - name: Descargar el modelo champion del último pipeline exitoso
+        run: |
+          RUN_ID=$(gh run list --workflow mlops.yml --status success --limit 1 \
+            --json databaseId --jq '.[0].databaseId')
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::No hay corridas exitosas de mlops.yml. Ejecuta primero el pipeline."
+            exit 1
+          fi
+          echo "Usando artefactos de la corrida $RUN_ID"
+          gh run download "$RUN_ID" --name production-artifacts --dir .
+
+      - name: Ejecutar monitor
+        id: monitor
+        run: |
+          set +e
+          python src/monitor.py --scenario "${{ inputs.scenario || 'none' }}" --fail-on-retrain
+          CODE=$?
+          set -e
+          echo "exit_code=$CODE" >> $GITHUB_OUTPUT
+          if [ $CODE -ne 0 ] && [ $CODE -ne 42 ]; then exit $CODE; fi
+
+      - name: Resumen
+        run: |
+          python - <<'PY' >> $GITHUB_STEP_SUMMARY
+          import json
+          r = json.load(open("reports/monitoring_report.json"))
+          print(f"## Decisión: {r['decision']}")
+          print(f"Fuente: `{r['source']}` · modelo v{r['model_version']} · F1 de referencia {r['reference_f1']}")
+          for reason in r["reasons"]:
+              print(f"- {reason}")
+          print("\n| ventana | psi_max | prediction_psi | f1 | decisión |\n|---|---|---|---|---|")
+          for w in r["windows"]:
+              f1 = w["performance"]["f1"] if w["performance"] else "s/e"
+              print(f"| {w['window']} | {w['psi_max']} | {w['prediction_drift']['psi']} | {f1} | {w['decision']} |")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monitoring-report
+          path: reports/monitoring_report.json
+
+      - name: Disparar reentrenamiento (Continuous Training)
+        if: steps.monitor.outputs.exit_code == '42'
+        run: |
+          echo "El monitor pidió reentrenar: se dispara mlops.yml"
+          gh workflow run mlops.yml --ref "${{ github.ref_name }}"
